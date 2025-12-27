@@ -1,0 +1,321 @@
+name: agent-runner-mvp
+
+on:
+  workflow_dispatch:
+    inputs:
+      fork_repo:
+        description: "Fork repo, e.g. agent-bot/some-repo"
+        required: true
+      upstream_repo:
+        description: "Upstream repo, e.g. vercel/next.js"
+        required: true
+      prompt:
+        description: "What to change"
+        required: true
+      job_id:
+        description: "Job identifier for tracking"
+        required: true
+      callback_url:
+        description: "URL to POST results when job completes (optional)"
+        required: false
+        default: ""
+
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install dependencies (jq, uv)
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y jq
+          # Install uv package manager (required for OpenHands SDK)
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Clone fork
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          FORK_REPO: ${{ inputs.fork_repo }}
+          UPSTREAM_REPO: ${{ inputs.upstream_repo }}
+        run: |
+          set -euo pipefail
+          git clone "https://x-access-token:${BOT_TOKEN}@github.com/${FORK_REPO}.git" repo
+          cd repo
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" || true
+          git fetch upstream --prune
+
+      - name: Create branch
+        env:
+          JOB_ID: ${{ inputs.job_id }}
+        run: |
+          set -euo pipefail
+          cd repo
+          BR="bot/${JOB_ID}"
+          echo "BRANCH=$BR" >> "$GITHUB_ENV"
+          git checkout -b "$BR"
+
+      - name: Setup OpenHands SDK
+        run: |
+          set -euo pipefail
+          # Create a virtual environment and install OpenHands SDK
+          uv venv .venv
+          source .venv/bin/activate
+          uv pip install openhands-sdk openhands-tools
+
+      - name: Run OpenHands Agent
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+          AGENT_PROMPT: ${{ inputs.prompt }}
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          
+          # Create the agent script
+          cat > run_agent.py << 'AGENT_SCRIPT'
+          import os
+          import sys
+          
+          from openhands.sdk import LLM, Agent, Conversation, Tool
+          from openhands.tools.file_editor import FileEditorTool
+          from openhands.tools.task_tracker import TaskTrackerTool
+          from openhands.tools.terminal import TerminalTool
+          
+          # Get the prompt from environment
+          prompt = os.getenv("AGENT_PROMPT", "")
+          if not prompt:
+              print("Error: No prompt provided")
+              sys.exit(1)
+          
+          # Initialize LLM
+          llm = LLM(
+              model=os.getenv("LLM_MODEL") or "anthropic/claude-sonnet-4-5-20250929",
+              api_key=os.getenv("LLM_API_KEY"),
+              base_url=os.getenv("LLM_BASE_URL", None),
+          )
+          
+          # Create agent with tools
+          agent = Agent(
+              llm=llm,
+              tools=[
+                  Tool(name=TerminalTool.name),
+                  Tool(name=FileEditorTool.name),
+                  Tool(name=TaskTrackerTool.name),
+              ],
+          )
+          
+          # Set workspace to the cloned repo
+          workspace = os.path.join(os.getcwd(), "repo")
+          
+          # Create conversation and run
+          conversation = Conversation(agent=agent, workspace=workspace)
+          conversation.send_message(prompt)
+          conversation.run()
+          
+          print("Agent completed successfully!")
+          AGENT_SCRIPT
+          
+          # Run the agent; prompt is passed via AGENT_PROMPT environment variable
+          python run_agent.py
+
+      - name: Commit & push
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          PROMPT: ${{ inputs.prompt }}
+        run: |
+          set -euo pipefail
+          cd repo
+          git config user.name "agent-bot"
+          git config user.email "agent-bot@users.noreply.github.com"
+
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            echo "HAS_CHANGES=false" >> "$GITHUB_ENV"
+            echo "PR_URL=" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          echo "HAS_CHANGES=true" >> "$GITHUB_ENV"
+          # Truncate prompt for commit message (max 72 chars)
+          COMMIT_MSG="bot: $(printf '%s' "$PROMPT" | head -c 60)"
+          git commit -m "$COMMIT_MSG"
+          git push -u origin "$BRANCH"
+
+      - name: Create PR (GitHub REST API)
+        id: create_pr
+        if: env.HAS_CHANGES == 'true'
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          UPSTREAM_REPO: ${{ inputs.upstream_repo }}
+          FORK_REPO: ${{ inputs.fork_repo }}
+          PROMPT: ${{ inputs.prompt }}
+          JOB_ID: ${{ inputs.job_id }}
+        run: |
+          set -euo pipefail
+
+          # 1) Get upstream default branch (base)
+          base=$(curl -s \
+            -H "Authorization: Bearer ${BOT_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${UPSTREAM_REPO}" | jq -r .default_branch)
+          if [ -z "$base" ] || [ "$base" = "null" ]; then
+            echo "::error::Failed to resolve upstream default branch."
+            exit 1
+          fi
+
+          # 2) head must be "<fork_owner>:<branch>"
+          fork_owner=$(echo "${FORK_REPO}" | cut -d/ -f1)
+          head="${fork_owner}:${BRANCH}"
+
+          title="Bot: ${PROMPT}"
+          body=$(printf "Automated changes via Agent Runner.\n\nJob: %s" "$JOB_ID")
+
+          payload=$(jq -n \
+            --arg title "$title" \
+            --arg head "$head" \
+            --arg base "$base" \
+            --arg body "$body" \
+            '{title:$title, head:$head, base:$base, body:$body}')
+
+          pr_response=$(curl -sS -w "\n%{http_code}" -X POST \
+            -H "Authorization: Bearer ${BOT_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${UPSTREAM_REPO}/pulls" \
+            -d "$payload")
+
+          pr_body=$(echo "$pr_response" | sed '$d')
+          pr_status=$(echo "$pr_response" | tail -n1)
+
+          pr_url=""
+
+          if [ "$pr_status" = "201" ]; then
+            pr_url=$(echo "$pr_body" | jq -r '.html_url // empty')
+          else
+            pr_message=$(echo "$pr_body" | jq -r '.message // empty' 2>/dev/null || true)
+            pr_errors=$(echo "$pr_body" | jq -r '.errors[]?.message? // empty' 2>/dev/null || true)
+
+            if echo "$pr_errors $pr_message" | grep -qi "already exists"; then
+              echo "::warning::PR already exists for head '$head'; fetching existing PR URL."
+              existing_prs=$(curl -sS \
+                -H "Authorization: Bearer ${BOT_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                --get \
+                --data-urlencode "head=${head}" \
+                --data-urlencode "state=open" \
+                --data-urlencode "per_page=1" \
+                "https://api.github.com/repos/${UPSTREAM_REPO}/pulls")
+
+              pr_url=$(echo "$existing_prs" | jq -r '.[0].html_url // empty')
+            else
+              echo "::error::Failed to create PR (HTTP $pr_status): ${pr_message:-unknown error}"
+              echo "$pr_body" | jq -r '.' || true
+              exit 1
+            fi
+          fi
+
+          if [ -z "$pr_url" ] || [ "$pr_url" = "null" ]; then
+            echo "::error::PR URL is empty; failing step to avoid misleading success."
+            exit 1
+          fi
+
+          echo "PR URL: $pr_url"
+
+          # Save PR URL for callback
+          echo "PR_URL=$pr_url" >> "$GITHUB_ENV"
+
+      # ========================================
+      # Callback Notification (always runs)
+      # ========================================
+      - name: Send callback notification (success)
+        if: (success() || env.HAS_CHANGES == 'false') && inputs.callback_url != ''
+        env:
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          CALLBACK_URL: ${{ inputs.callback_url }}
+          UPSTREAM_REPO: ${{ inputs.upstream_repo }}
+          FORK_REPO: ${{ inputs.fork_repo }}
+          JOB_ID: ${{ inputs.job_id }}
+        run: |
+          set -euo pipefail
+          
+          callback_url="$CALLBACK_URL"
+          
+          payload=$(jq -n \
+            --arg job_id "$JOB_ID" \
+            --arg status "completed" \
+            --arg pr_url "${PR_URL:-}" \
+            --arg upstream_repo "$UPSTREAM_REPO" \
+            --arg fork_repo "$FORK_REPO" \
+            --arg branch "${BRANCH:-}" \
+            '{
+              job_id: $job_id,
+              status: $status,
+              pr_url: (if $pr_url == "" then null else $pr_url end),
+              upstream_repo: $upstream_repo,
+              fork_repo: $fork_repo,
+              branch: $branch
+            }')
+          
+          # Generate HMAC signature if secret is configured
+          if [ -n "${WEBHOOK_SECRET:-}" ]; then
+            signature="sha256=$(echo -n "$payload" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" | cut -d' ' -f2)"
+            curl -s -X POST \
+              -H "Content-Type: application/json" \
+              -H "X-Signature-256: $signature" \
+              "$callback_url" \
+              -d "$payload"
+          else
+            curl -s -X POST \
+              -H "Content-Type: application/json" \
+              "$callback_url" \
+              -d "$payload"
+          fi
+          
+          echo "Callback sent successfully!"
+
+      - name: Send callback notification (failure)
+        if: failure() && inputs.callback_url != ''
+        env:
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          CALLBACK_URL: ${{ inputs.callback_url }}
+          UPSTREAM_REPO: ${{ inputs.upstream_repo }}
+          FORK_REPO: ${{ inputs.fork_repo }}
+          JOB_ID: ${{ inputs.job_id }}
+        run: |
+          set -euo pipefail
+          
+          callback_url="$CALLBACK_URL"
+          
+          payload=$(jq -n \
+            --arg job_id "$JOB_ID" \
+            --arg status "failed" \
+            --arg error "Workflow failed. Check GitHub Actions logs for details." \
+            --arg upstream_repo "$UPSTREAM_REPO" \
+            --arg fork_repo "$FORK_REPO" \
+            '{
+              job_id: $job_id,
+              status: $status,
+              error: $error,
+              upstream_repo: $upstream_repo,
+              fork_repo: $fork_repo
+            }')
+          
+          # Generate HMAC signature if secret is configured
+          if [ -n "${WEBHOOK_SECRET:-}" ]; then
+            signature="sha256=$(echo -n "$payload" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" | cut -d' ' -f2)"
+            curl -s -X POST \
+              -H "Content-Type: application/json" \
+              -H "X-Signature-256: $signature" \
+              "$callback_url" \
+              -d "$payload"
+          else
+            curl -s -X POST \
+              -H "Content-Type: application/json" \
+              "$callback_url" \
+              -d "$payload"
+          fi
+          
+          echo "Failure callback sent!"
