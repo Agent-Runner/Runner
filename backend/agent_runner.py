@@ -437,7 +437,9 @@ class AgentRunner:
 def create_fastapi_app():
     """Create a FastAPI application with Agent Runner endpoints."""
     try:
+        from contextlib import asynccontextmanager
         from fastapi import FastAPI, HTTPException, Request
+        from fastapi.responses import JSONResponse
         from pydantic import BaseModel
     except ImportError:
         print("FastAPI not installed. Run: pip install fastapi uvicorn")
@@ -445,20 +447,47 @@ def create_fastapi_app():
     
     import os
     
-    app = FastAPI(title="Agent Runner API")
+    # Validate required environment variables at startup
+    required_vars = ["BOT_TOKEN", "RUNNER_REPO", "BOT_USERNAME"]
+    missing = [v for v in required_vars if not os.environ.get(v)]
+    if missing:
+        raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
     
     allow_insecure_webhooks = os.environ.get("ALLOW_INSECURE_WEBHOOKS", "").lower() in ("1", "true", "yes")
+    webhook_secret = os.environ.get("WEBHOOK_SECRET")
+    
+    # Warn about insecure configuration
+    if not webhook_secret and not allow_insecure_webhooks:
+        logger.warning(
+            "WEBHOOK_SECRET not set. Callbacks will be rejected unless ALLOW_INSECURE_WEBHOOKS=1. "
+            "Set WEBHOOK_SECRET for production use."
+        )
+    elif not webhook_secret and allow_insecure_webhooks:
+        logger.warning("Running in INSECURE mode: webhook signatures are not being verified!")
+    
     runner = AgentRunner(
         bot_token=os.environ["BOT_TOKEN"],
         runner_repo=os.environ["RUNNER_REPO"],
         bot_username=os.environ["BOT_USERNAME"],
-        webhook_secret=os.environ.get("WEBHOOK_SECRET"),
+        webhook_secret=webhook_secret,
         allow_insecure_webhooks=allow_insecure_webhooks,
     )
-
-    @app.on_event("shutdown")
-    async def shutdown() -> None:
+    
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        """Manage application lifecycle."""
+        logger.info(f"Agent Runner starting up (runner_repo={runner.runner_repo})")
+        yield
+        # Cleanup on shutdown
+        logger.info("Agent Runner shutting down...")
         await runner.close()
+    
+    app = FastAPI(
+        title="Agent Runner API",
+        description="AI-powered code modification runner using OpenHands SDK",
+        version="1.0.0",
+        lifespan=lifespan,
+    )
     
     class SubmitJobRequest(BaseModel):
         upstream_repo: str
@@ -471,6 +500,15 @@ def create_fastapi_app():
         pr_url: Optional[str] = None
         error: Optional[str] = None
     
+    @app.get("/health")
+    async def health_check():
+        """Health check endpoint for load balancers and monitoring."""
+        return {
+            "status": "healthy",
+            "service": "agent-runner",
+            "runner_repo": runner.runner_repo,
+        }
+    
     @app.post("/api/jobs")
     async def submit_job(request: SubmitJobRequest):
         """Submit a new agent runner job."""
@@ -480,10 +518,12 @@ def create_fastapi_app():
                 prompt=request.prompt,
                 callback_url=request.callback_url,
             )
+            logger.info(f"Job submitted: job_id={job.job_id}, upstream={job.upstream_repo}")
             return job.to_dict()
         except HTTPException:
             raise
         except ValueError as e:
+            logger.warning(f"Invalid job request: {e}")
             raise HTTPException(status_code=400, detail=str(e))
         except Exception:
             logger.exception("Unexpected error while submitting job")
@@ -509,9 +549,14 @@ def create_fastapi_app():
         body = await request.body()
         
         if not runner.verify_webhook_signature(body, signature):
+            logger.warning(f"Webhook signature verification failed")
             raise HTTPException(status_code=401, detail="Invalid signature")
         
-        payload = CallbackPayload(**json.loads(body))
+        try:
+            payload = CallbackPayload(**json.loads(body))
+        except Exception as e:
+            logger.warning(f"Invalid callback payload: {e}")
+            raise HTTPException(status_code=400, detail="Invalid payload format")
         
         job = runner.update_job_from_callback(
             job_id=payload.job_id,
@@ -521,8 +566,10 @@ def create_fastapi_app():
         )
         
         if not job:
+            logger.warning(f"Callback received for unknown job: {payload.job_id}")
             raise HTTPException(status_code=404, detail="Job not found")
         
+        logger.info(f"Job updated via callback: job_id={job.job_id}, status={job.status.value}")
         return {"status": "ok", "job": job.to_dict()}
     
     return app
