@@ -2,6 +2,7 @@
 Webhook callback handling.
 """
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -83,6 +84,8 @@ class CallbackHandler:
         callback_url: str,
         payload: dict,
         timeout: float = 10.0,
+        max_attempts: int = 3,
+        backoff_seconds: float = 1.0,
     ) -> bool:
         """
         Send callback notification to URL.
@@ -91,6 +94,8 @@ class CallbackHandler:
             callback_url: URL to POST to
             payload: JSON payload
             timeout: Request timeout in seconds
+            max_attempts: Maximum number of attempts to send callback
+            backoff_seconds: Base backoff delay between retries in seconds
             
         Returns:
             True if callback was sent successfully
@@ -99,31 +104,52 @@ class CallbackHandler:
             logger.debug("No callback URL configured, skipping")
             return False
         
-        try:
-            payload_bytes = json.dumps(payload).encode()
-            headers = {"Content-Type": "application/json"}
-            
-            if self.webhook_secret:
-                signature = self.generate_signature(payload_bytes)
-                headers["X-Signature-256"] = signature
-            
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                response = await client.post(
-                    callback_url,
-                    content=payload_bytes,
-                    headers=headers,
-                )
-                
-                if response.status_code < 400:
-                    logger.info(f"Callback sent to {callback_url}")
-                    return True
-                else:
-                    logger.warning(f"Callback failed: {response.status_code}")
+        payload_bytes = json.dumps(payload).encode()
+        headers = {"Content-Type": "application/json"}
+
+        if self.webhook_secret:
+            signature = self.generate_signature(payload_bytes)
+            headers["X-Signature-256"] = signature
+
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    response = await client.post(
+                        callback_url,
+                        content=payload_bytes,
+                        headers=headers,
+                    )
+
+                    if response.status_code < 400:
+                        logger.info(f"Callback sent to {callback_url}")
+                        return True
+
+                    response_snippet = response.text[:200] if response.text else ""
+                    log_suffix = f": {response_snippet}" if response_snippet else ""
+                    if response.status_code == 429 or response.status_code >= 500:
+                        logger.warning(
+                            "Callback attempt %s failed with status %s%s",
+                            attempt,
+                            response.status_code,
+                            log_suffix,
+                        )
+                    else:
+                        logger.warning(
+                            "Callback failed with status %s%s",
+                            response.status_code,
+                            log_suffix,
+                        )
+                        return False
+                except httpx.RequestError as e:
+                    logger.warning("Callback attempt %s failed: %s", attempt, e)
+                except Exception as e:
+                    logger.error(f"Failed to send callback: {e}")
                     return False
-                    
-        except Exception as e:
-            logger.error(f"Failed to send callback: {e}")
-            return False
+
+                if attempt < max_attempts:
+                    await asyncio.sleep(backoff_seconds * attempt)
+
+        return False
     
     async def send_success_callback(
         self,

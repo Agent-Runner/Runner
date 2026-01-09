@@ -70,8 +70,8 @@ def main() -> int:
     prompt = os.environ.get("AGENT_PROMPT", "")
     
     # Configure git
-    run_cmd(["git", "config", "user.name", "agent-bot"])
-    run_cmd(["git", "config", "user.email", "agent-bot@users.noreply.github.com"])
+    run_cmd(["git", "config", "user.name", "Satori-Bot"])
+    run_cmd(["git", "config", "user.email", "211923187+Satori-Bot@users.noreply.github.com"])
     
     # Debug: Show current status
     print("::group::Git Status")
