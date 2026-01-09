@@ -158,7 +158,6 @@ async def cmd_create_pr(args: argparse.Namespace) -> int:
                 "## Notes",
                 "- Please review the changes and adjust as needed before merging.",
             ]
-            if line is not None
         )
         
         pr_url = await pr_manager.create_pr(
