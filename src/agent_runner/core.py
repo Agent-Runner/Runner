@@ -144,7 +144,8 @@ class AgentRunner:
         if not self._validate_repo_path(upstream_repo):
             raise ValueError(f"Invalid repository path: {upstream_repo}. Expected format: owner/repo")
         
-        if not prompt or not prompt.strip():
+        prompt = prompt.strip() if prompt is not None else ""
+        if not prompt:
             raise ValueError("Prompt cannot be empty")
 
         callback_url = callback_url.strip() if callback_url is not None else None
