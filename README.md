@@ -48,21 +48,43 @@ Add these secrets to your Agent-Runner repository:
 | `LLM_MODEL` | (Optional) Model name, defaults to `anthropic/claude-sonnet-4-5-20250929` |
 | `WEBHOOK_SECRET` | Secret for signing/validating webhook callbacks (recommended; required unless `ALLOW_INSECURE_WEBHOOKS=1`) |
 
-### 2. Deploy Backend Service
+### 2. Trigger via GitHub API (Primary Method)
+
+The primary way to use Agent-Runner is through GitHub's `workflow_dispatch` API:
 
 ```bash
-cd backend
-pip install -r requirements.txt
+curl -X POST \
+  -H "Authorization: Bearer <BOT_TOKEN>" \
+  -H "Accept: application/vnd.github+json" \
+  https://api.github.com/repos/<your-org>/Agent-Runner/actions/workflows/run.yml/dispatches \
+  -d '{
+    "ref": "main",
+    "inputs": {
+      "fork_repo": "bot/repo",
+      "upstream_repo": "owner/repo",
+      "prompt": "Fix the typo in README.md",
+      "job_id": "job-123",
+      "callback_url": "https://your-backend.com/webhook"
+    }
+  }'
+```
+
+### 3. (Optional) Deploy HTTP Server
+
+If you prefer an HTTP API interface:
+
+```bash
+# Install with server extras
+pip install -e '.[server]'
 
 # Set environment variables
 export BOT_TOKEN="ghp_xxx"
 export RUNNER_REPO="your-org/Agent-Runner"
 export BOT_USERNAME="your-bot-username"
-export WEBHOOK_SECRET="your-secret-key"  # Recommended (required to verify callback signatures)
-# Local dev only (not recommended): export ALLOW_INSECURE_WEBHOOKS=1
+export WEBHOOK_SECRET="your-secret-key"
 
-# Run with uvicorn
-uvicorn agent_runner:create_fastapi_app --factory --host 0.0.0.0 --port 8000
+# Run server
+uvicorn server.app:app --host 0.0.0.0 --port 8000
 ```
 
 ### 3. Submit a Job
@@ -434,10 +456,26 @@ export LLM_MODEL="openhands/claude-sonnet-4-5-20250929"
 Agent-Runner/
 ├── .github/
 │   └── workflows/
-│       └── run.yml          # GitHub Actions workflow
-├── backend/
-│   ├── agent_runner.py      # Backend service
-│   └── requirements.txt     # Python dependencies
+│       └── run.yml              # GitHub Actions workflow (thin, calls Python CLI)
+├── src/
+│   └── agent_runner/
+│       ├── __init__.py          # Package exports
+│       ├── cli.py               # CLI entry point (submit, run, pr, callback)
+│       ├── core.py              # Core AgentRunner service
+│       ├── models.py            # Data models (Job, JobStatus)
+│       ├── callback.py          # Webhook callback handling
+│       └── github/
+│           ├── client.py        # GitHub API client
+│           ├── repo.py          # Repository operations (fork, sync)
+│           ├── pr.py            # Pull request operations
+│           └── workflow.py      # Workflow dispatch
+├── scripts/
+│   ├── sync_fork.py             # Sync fork with upstream
+│   └── commit_push.py           # Commit and push changes
+├── server/
+│   └── app.py                   # Optional FastAPI HTTP server
+├── pyproject.toml               # Python package configuration
+├── requirements.txt             # Core dependencies
 ├── LICENSE
 └── README.md
 ```

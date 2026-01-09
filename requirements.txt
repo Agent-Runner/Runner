@@ -1,0 +1,14 @@
+# Agent Runner Dependencies
+
+# Core dependencies
+httpx>=0.27.0
+pydantic>=2.9.0
+
+# Web framework (optional, for REST API server)
+# Install with: pip install 'agent-runner[server]'
+# fastapi>=0.115.0
+# uvicorn>=0.32.0
+
+# OpenHands SDK (installed separately in CI)
+# openhands-sdk
+# openhands-tools
