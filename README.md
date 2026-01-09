@@ -87,7 +87,7 @@ export WEBHOOK_SECRET="your-secret-key"
 uvicorn server.app:app --host 0.0.0.0 --port 8000
 ```
 
-### 3. Submit a Job
+### 4. Submit a Job
 
 ```bash
 curl -X POST http://localhost:8000/api/jobs \
