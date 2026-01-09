@@ -3,7 +3,7 @@ GitHub API client wrapper.
 """
 
 import logging
-from typing import Any, Optional
+from typing import Optional
 
 import httpx
 
