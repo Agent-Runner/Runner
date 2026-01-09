@@ -5,7 +5,6 @@ GitHub repository operations (fork, sync, clone).
 import asyncio
 import logging
 import time
-from typing import Optional
 
 from agent_runner.github.client import GitHubClient
 
