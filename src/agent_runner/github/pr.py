@@ -3,7 +3,6 @@ GitHub Pull Request operations.
 """
 
 import logging
-from typing import Optional
 
 from agent_runner.github.client import GitHubClient
 
